@@ -42,11 +42,54 @@ log = logging.getLogger(__name__)
 # nobody cares if paramiko successfully connects. not what we are looking for.
 logging.getLogger("paramiko").setLevel(logging.WARNING)
 
-destinations = [
-    ('github.com', 22),
-    ('gitlab.com', 22),
-    ('bitbucket.com', 22),
-]
+details = dict()
+details['github.com'] = { 'port': 22 }
+details['gitlab.com'] = { 'port': 22 }
+details['bitbucket.com'] = { 'port': 22 }
+
+# build the destinations array that exitmap needs
+
+destinations = []
+for host in details:
+    destinations.append((host, details[host]['port']))
+
+def setup():
+    """
+    Perform one-off setup tasks, i.e., download reference files.
+    """
+
+    log.info('obtaining ssh key information for destinations')
+
+    for host, port in destinations:
+
+        log.info('getting key for %s' % (host))
+
+        ipv4 = socket.gethostbyname(host)
+        address = '%s:%s' % (ipv4, port)
+
+        try:
+            transport = paramiko.transport.Transport(address)
+        except paramiko.SSHException as err:
+            log.info('ssh connection error to %s:%s (%s) over exit relay %s: %s' % (host, port, ipv4, exit_desc.fingerprint, err))
+            return
+
+        try:
+            transport.start_client()
+        except paramiko.SSHException as err:
+            log.info('ssh connection error to %s:%s (%s) over exit relay %s: %s' % (host, port, ipv4, exit_desc.fingerprint, err))
+            return
+
+        key = transport.get_remote_server_key()
+        transport.close()
+
+        key_name = key.get_name()
+        key_base64 = key.get_base64()
+
+        log.debug('ssh key (clear) name for %s:%s (%s): %s' % (host, port, ipv4, key_name))
+        log.debug('ssh key (clear) for %s:%s (%s): %s' % (host, port, ipv4, key_base64))
+
+        details[host]['key_name'] = key_name
+        details[host]['key_base64'] = key_base64
 
 def test_ssh(exit_desc):
 
@@ -57,34 +100,8 @@ def test_ssh(exit_desc):
     AF_INET = socket.AF_INET
     SOCK_STREAM = socket.SOCK_STREAM
 
-    for server, port in destinations:
+    for host, port in destinations:
 
-        # work through each test target
-
-        # obtain the clear-wire host key that will be used for comparison
-        ipv4 = socket.gethostbyname(server)
-        address = '%s:%s' % (ipv4, port)
-
-        try:
-            transport = paramiko.transport.Transport(address)
-        except paramiko.SSHException as err:
-            log.info('ssh connection error to %s:%s (%s) over exit relay %s: %s' % (server, port, ipv4, exit_desc.fingerprint, err))
-            return
-
-        try:
-            transport.start_client()
-        except paramiko.SSHException as err:
-            log.info('ssh connection error to %s:%s (%s) over exit relay %s: %s' % (server, port, ipv4, exit_desc.fingerprint, err))
-            return
-
-        key = transport.get_remote_server_key()
-        transport.close()
-
-        key_name = key.get_name()
-        key_base64 = key.get_base64()
-
-        log.debug('ssh key (clear) name for %s:%s (%s): %s' % (server, port, ipv4, key_name))
-        log.debug('ssh key (clear) for %s:%s (%s): %s' % (server, port, ipv4, key_base64))
         # construct the tor socket
 
         sock = torsocks.torsocket()
@@ -93,8 +110,8 @@ def test_ssh(exit_desc):
         # resolve the ip over tor, like it normally would for a client.
 
         try:
-            ipv4 = sock.resolve(server)
-            log.debug("destination %s resolves to: %s" % (server, ipv4))
+            ipv4 = sock.resolve(host)
+            log.debug("destination %s resolves to: %s" % (host, ipv4))
         except SOCKSv5Error as err:
             log.debug("%s did not resolve broken domain because: %s." % (exit_url, err))
             return
@@ -104,10 +121,13 @@ def test_ssh(exit_desc):
         except Exception as err:
             log.debug("Could not resolve domain because: %s" % err)
             return
+        finally:
+            sock.close()
 
         # connect to the actual target
+        sock = torsocks.torsocket()
+        sock.settimeout(10)
 
-        sock = socket.socket(AF_INET, SOCK_STREAM)
         address = (ipv4, port)
         sock.connect(address)
 
@@ -115,13 +135,13 @@ def test_ssh(exit_desc):
         try:
             client = paramiko.transport.Transport(sock)
         except paramiko.SSHException as err:
-            log.info('ssh connection error to %s:%s (%s) over exit relay %s: %s' % (server, port, ipv4, exit_desc.fingerprint, err))
+            log.info('ssh connection error to %s:%s (%s) over exit relay %s: %s' % (host, port, ipv4, exit_desc.fingerprint, err))
             return
 
         try:
             client.start_client()
         except paramiko.SSHException as err:
-            log.info('ssh connection error to %s:%s (%s) over exit relay %s: %s' % (server, port, ipv4, exit_desc.fingerprint, err))
+            log.info('ssh connection error to %s:%s (%s) over exit relay %s: %s' % (host, port, ipv4, exit_desc.fingerprint, err))
             return
 
         key = client.get_remote_server_key()
@@ -130,19 +150,22 @@ def test_ssh(exit_desc):
 
         tor_key_name = key.get_name()
         tor_key_base64 = key.get_base64()
-        log.debug('ssh key (tor) name for %s:%s (%s): %s' % (server, port, ipv4, tor_key_name))
-        log.debug('ssh key (tor) for %s:%s (%s): %s' % (server, port, ipv4, tor_key_base64))
+        log.debug('ssh key (tor) name for %s:%s (%s): %s' % (host, port, ipv4, tor_key_name))
+        log.debug('ssh key (tor) for %s:%s (%s): %s' % (host, port, ipv4, tor_key_base64))
 
         # do the matching
+
+        key_name = details[host]['key_name']
+        key_base64 = details[host]['key_base64']
 
         if not key_name == tor_key_name:
             log.critical('tor ssh key name mismatch over exit relay %s. clear wire value: %s, over tor value: %s' % (exit_desc.fingerprint, key_name, tor_key_name))
         else:
-            log.debug('tor ssh key name match for %s:%s (%s) over exit relay %s' % (server, port, ipv4, exit_desc.fingerprint))
+            log.debug('tor ssh key name match for %s:%s (%s) over exit relay %s' % (host, port, ipv4, exit_desc.fingerprint))
         if not key_base64 == tor_key_base64:
             log.critical('tor ssh key mismatch over exit relay %s. clear wire value: %s, over tor value: %s' % (exit_desc.fingerprint, key_base64, tor_key_base64))
         else:
-            log.debug('tor ssh key match for %s:%s (%s) over exit relay %s' % (server, port, ipv4, exit_desc.fingerprint))
+            log.debug('tor ssh key match for %s:%s (%s) over exit relay %s' % (host, port, ipv4, exit_desc.fingerprint))
 
 def probe(exit_desc, run_python_over_tor, run_cmd_over_tor, **kwargs):
     """
