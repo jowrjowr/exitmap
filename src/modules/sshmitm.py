@@ -159,11 +159,11 @@ def test_ssh(exit_desc):
         key_base64 = details[host]['key_base64']
 
         if not key_name == tor_key_name:
-            log.critical('tor ssh key name mismatch over exit relay %s. clear wire value: %s, over tor value: %s' % (exit_desc.fingerprint, key_name, tor_key_name))
+            log.critical('tor ssh key name mismatch for %s:%s (%s) over exit relay %s clear wire value: %s, over tor value: %s' % (host, port, ipv4, exit_desc.fingerprint, key_name, tor_key_name))
         else:
             log.debug('tor ssh key name match for %s:%s (%s) over exit relay %s' % (host, port, ipv4, exit_desc.fingerprint))
         if not key_base64 == tor_key_base64:
-            log.critical('tor ssh key mismatch over exit relay %s. clear wire value: %s, over tor value: %s' % (exit_desc.fingerprint, key_base64, tor_key_base64))
+            log.critical('tor ssh key mismatch for %s:%s (%s) over exit relay %s clear wire value: %s, over tor value: %s' % (host, port, ipv4, exit_desc.fingerprint, key_base64, tor_key_base64))
         else:
             log.debug('tor ssh key match for %s:%s (%s) over exit relay %s' % (host, port, ipv4, exit_desc.fingerprint))
 
