@@ -22,25 +22,20 @@ Module to detect ssh mitm
 """
 
 import sys
-import json
 import logging
 import paramiko
-import socks
 import socket
-import util
-import torsocks
-import error
-from stem import Signal
-from stem.control import Controller
+
+from torsocks import torsocket
+from util import exiturl
 from error import SOCKSv5Error
-import stem.descriptor.server_descriptor as descriptor
 
 # setup logging
 
 log = logging.getLogger(__name__)
 
 # nobody cares if paramiko successfully connects. not what we are looking for.
-logging.getLogger("paramiko").setLevel(logging.WARNING)
+logging.getLogger("paramiko").setLevel(logging.CRITICAL)
 
 details = dict()
 details['github.com'] = { 'port': 22 }
@@ -70,24 +65,37 @@ def setup():
         try:
             transport = paramiko.transport.Transport(address)
         except paramiko.SSHException as err:
-            log.info('ssh connection error to %s:%s (%s) over exit relay %s: %s' % (host, port, ipv4, exit_desc.fingerprint, err))
+            log.info('ssh connection error to %s:%s (%s) over exit relay %s: %s' % (host, port, ipv4, exit_fp, err))
             return
 
         try:
             transport.start_client()
+        except EOFError as e:
+            log.info('unknown ssh connection error to %s:%s (%s) over exit relay %s: %s' % (host, port, ipv4, exit_fp, err))
+            return
         except paramiko.SSHException as err:
-            log.info('ssh connection error to %s:%s (%s) over exit relay %s: %s' % (host, port, ipv4, exit_desc.fingerprint, err))
+            log.info('ssh connection error to %s:%s (%s) over exit relay %s: %s' % (host, port, ipv4, exit_fp, err))
             return
 
-        key = transport.get_remote_server_key()
-        transport.close()
+        try:
+            key = transport.get_remote_server_key()
+            version = transport.remote_version
+        except paramiko.SSHException as err:
+            log.info('unable to retreive remote key for %s:%s (%s) over exit relay %s: %s' % (host, port, ipv4, exit_fp, err))
+            return
+        finally:
+            transport.close()
+
 
         key_name = key.get_name()
         key_base64 = key.get_base64()
 
+
         log.debug('ssh key (clear) name for %s:%s (%s): %s' % (host, port, ipv4, key_name))
         log.debug('ssh key (clear) for %s:%s (%s): %s' % (host, port, ipv4, key_base64))
+        log.debug('ssh version (clear) for %s:%s (%s): %s' % (host, port, ipv4, version))
 
+        details[host]['version'] = version
         details[host]['key_name'] = key_name
         details[host]['key_base64'] = key_base64
 
@@ -96,15 +104,18 @@ def test_ssh(exit_desc):
     """
     is you or is you not MITMing my ssh?
     """
-    exit_url = util.exiturl(exit_desc.fingerprint)
-    AF_INET = socket.AF_INET
-    SOCK_STREAM = socket.SOCK_STREAM
+    exit_fp = exit_desc.fingerprint
+    exit_url = exiturl(exit_fp)
+
+    log.debug('testing exit %s' % (exit_fp))
+
+    fail_count = 0
 
     for host, port in destinations:
 
         # construct the tor socket
 
-        sock = torsocks.torsocket()
+        sock = torsocket()
         sock.settimeout(10)
 
         # resolve the ip over tor, like it normally would for a client.
@@ -114,18 +125,21 @@ def test_ssh(exit_desc):
             log.debug("destination %s resolves to: %s" % (host, ipv4))
         except SOCKSv5Error as err:
             log.debug("%s did not resolve broken domain because: %s." % (exit_url, err))
-            return
+            fail_count += 1
+            continue
         except socket.timeout as err:
             log.debug("Socket over exit relay %s timed out: %s" % (exit_url, err))
-            return
+            fail_count += 1
+            continue
         except Exception as err:
             log.debug("Could not resolve domain because: %s" % err)
-            return
+            fail_count += 1
+            continue
         finally:
             sock.close()
 
         # connect to the actual target
-        sock = torsocks.torsocket()
+        sock = torsocket()
         sock.settimeout(10)
 
         address = (ipv4, port)
@@ -134,16 +148,27 @@ def test_ssh(exit_desc):
         # get the over-tor key information
         try:
             client = paramiko.transport.Transport(sock)
+        except EOFError as err:
+            log.info('unknown ssh connection error to %s:%s (%s) over exit relay %s: %s' % (host, port, ipv4, exit_fp, err))
+            fail_count += 1
+            continue
         except paramiko.SSHException as err:
-            log.info('ssh connection error to %s:%s (%s) over exit relay %s: %s' % (host, port, ipv4, exit_desc.fingerprint, err))
-            return
+            log.info('ssh exception conneting to %s:%s (%s) over exit relay %s: %s' % (host, port, ipv4, exit_fp, err))
+            fail_count += 1
+            continue
 
         try:
             client.start_client()
+        except EOFError as err:
+            log.info('unknown ssh connection error to %s:%s (%s) over exit relay %s: %s' % (host, port, ipv4, exit_fp, err))
+            fail_count += 1
+            continue
         except paramiko.SSHException as err:
-            log.info('ssh connection error to %s:%s (%s) over exit relay %s: %s' % (host, port, ipv4, exit_desc.fingerprint, err))
-            return
+            log.info('ssh connection error to %s:%s (%s) over exit relay %s: %s' % (host, port, ipv4, exit_fp, err))
+            fail_count += 1
+            continue
 
+        tor_version = client.remote_version
         key = client.get_remote_server_key()
         client.close()
         sock.close()
@@ -152,20 +177,36 @@ def test_ssh(exit_desc):
         tor_key_base64 = key.get_base64()
         log.debug('ssh key (tor) name for %s:%s (%s): %s' % (host, port, ipv4, tor_key_name))
         log.debug('ssh key (tor) for %s:%s (%s): %s' % (host, port, ipv4, tor_key_base64))
+        log.debug('ssh version (tor) for %s:%s (%s): %s' % (host, port, ipv4, tor_version))
 
         # do the matching
 
+        version = details[host]['version']
         key_name = details[host]['key_name']
         key_base64 = details[host]['key_base64']
 
         if not key_name == tor_key_name:
-            log.critical('tor ssh key name mismatch for %s:%s (%s) over exit relay %s clear wire value: %s, over tor value: %s' % (host, port, ipv4, exit_desc.fingerprint, key_name, tor_key_name))
+            log.critical('tor ssh key name mismatch for %s:%s (%s) over exit relay %s clear wire value: %s, over tor value: %s' % (host, port, ipv4, exit_fp, key_name, tor_key_name))
         else:
-            log.debug('tor ssh key name match for %s:%s (%s) over exit relay %s' % (host, port, ipv4, exit_desc.fingerprint))
+            log.debug('tor ssh key name match for %s:%s (%s) over exit relay %s' % (host, port, ipv4, exit_fp))
         if not key_base64 == tor_key_base64:
-            log.critical('tor ssh key mismatch for %s:%s (%s) over exit relay %s clear wire value: %s, over tor value: %s' % (host, port, ipv4, exit_desc.fingerprint, key_base64, tor_key_base64))
+            log.critical('tor ssh key mismatch for %s:%s (%s) over exit relay %s' % (host, port, ipv4, exit_fp))
+            log.critical('clear wire key: %s' % (key_base64))
+            log.critical('clear wire version: %s' % (version))
+            log.critical('over tor key: %s' % (tor_key_base64))
+            log.critical('over tor version: %s' % (tor_version))
+            log.info('atlas link: https://atlas.torproject.org/#details/%s' % (exit_fp))
         else:
-            log.debug('tor ssh key match for %s:%s (%s) over exit relay %s' % (host, port, ipv4, exit_desc.fingerprint))
+            log.debug('tor ssh key match for %s:%s (%s) over exit relay %s' % (host, port, ipv4, exit_fp))
+
+    # if EVERY host is unable to be connected to, this could indicate a broken/misconfigured exit
+
+    if fail_count == len(details):
+        log.warning('exit %s appears to be having issues connecting over ssh. misconfiguration?' % (exit_fp))
+        log.info('atlas link: https://atlas.torproject.org/#details/%s' % (exit_fp))
+
+    if fail_count > 0:
+        log.warning('%s of %s ssh connections have failed over exit %s' % (fail_count, len(details), exit_fp))
 
 def probe(exit_desc, run_python_over_tor, run_cmd_over_tor, **kwargs):
     """
